@@ -1,20 +1,21 @@
-import torch
-import torch.nn as nn
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
 
-class PatchEmbedding(nn.Module):
+class PatchEmbedding(nn.Layer):
     def __init__(self, img_size, patch_size, in_channels, embed_dim):
         super().__init__()
         self.num_patches = (img_size // patch_size) ** 2
         self.patch_size = patch_size
-        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.proj = nn.Conv2D(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x):
         # 输入: [B, C, H, W]
         x = self.proj(x)  # [B, embed_dim, H/P, W/P]
-        x = x.flatten(2).transpose(1, 2)  # [B, num_patches, embed_dim]
+        x = paddle.flatten(x, 2).transpose([0, 2, 1])  # [B, num_patches, embed_dim]
         return x
 
-class Attention(nn.Module):
+class Attention(nn.Layer):
     def __init__(self, dim, num_heads, dropout=0.1):
         super().__init__()
         self.num_heads = num_heads
@@ -27,17 +28,23 @@ class Attention(nn.Module):
 
     def forward(self, x):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x).reshape([B, N, 3, self.num_heads, C // self.num_heads])
+        qkv = paddle.transpose(qkv, [2, 0, 3, 1, 4])
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, C//num_heads]
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
+        
+        # 矩阵乘法
+        attn = paddle.matmul(q, paddle.transpose(k, [0, 1, 3, 2])) * self.scale
+        attn = F.softmax(attn, axis=-1)
         attn = self.attn_drop(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        
+        x = paddle.matmul(attn, v)
+        x = paddle.transpose(x, [0, 2, 1, 3])
+        x = x.reshape([B, N, C])
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
 
-class MLP(nn.Module):
+class MLP(nn.Layer):
     def __init__(self, dim, hidden_dim, dropout=0.1):
         super().__init__()
         self.fc1 = nn.Linear(dim, hidden_dim)
@@ -52,7 +59,7 @@ class MLP(nn.Module):
         x = self.drop(x)
         return x
 
-class TransformerEncoderLayer(nn.Module):
+class TransformerEncoderLayer(nn.Layer):
     def __init__(self, dim, num_heads, mlp_ratio=4.0, dropout=0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
@@ -65,26 +72,26 @@ class TransformerEncoderLayer(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
-class VisionTransformer(nn.Module):
+class VisionTransformer(nn.Layer):
     def __init__(self, img_size=224, patch_size=16, in_channels=3, num_classes=100, embed_dim=192,
                  depth=6, num_heads=3, mlp_ratio=4.0, dropout=0.1):
         super().__init__()
         self.patch_embed = PatchEmbedding(img_size, patch_size, in_channels, embed_dim)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, (img_size // patch_size) ** 2 + 1, embed_dim))
+        self.cls_token = self.create_parameter(shape=[1, 1, embed_dim], default_initializer=nn.initializer.Constant(0.0))
+        self.pos_embed = self.create_parameter(shape=[1, (img_size // patch_size) ** 2 + 1, embed_dim], default_initializer=nn.initializer.Constant(0.0))
         self.pos_drop = nn.Dropout(p=dropout)
 
-        self.layers = nn.ModuleList([
+        self.layers = nn.LayerList([
             TransformerEncoderLayer(embed_dim, num_heads, mlp_ratio, dropout) for _ in range(depth)
         ])
         self.norm = nn.LayerNorm(embed_dim)
         self.head = nn.Linear(embed_dim, num_classes)
 
     def forward(self, x):
-        B = x.size(0)
+        B = x.shape[0]
         x = self.patch_embed(x)  # [B, num_patches, embed_dim]
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # [B, 1, embed_dim]
-        x = torch.cat((cls_tokens, x), dim=1)  # [B, num_patches+1, embed_dim]
+        cls_tokens = paddle.expand(self.cls_token, [B, -1, -1])  # [B, 1, embed_dim]
+        x = paddle.concat([cls_tokens, x], axis=1)  # [B, num_patches+1, embed_dim]
         x = x + self.pos_embed
         x = self.pos_drop(x)
 
@@ -96,6 +103,7 @@ class VisionTransformer(nn.Module):
         return cls_logits
 
 if __name__ == '__main__':
+    paddle.set_device('gpu')
     model = VisionTransformer(
         img_size=32,        # 调整图像大小
         patch_size=8,       # Patch 大小
@@ -106,7 +114,7 @@ if __name__ == '__main__':
         num_heads=4,         # 多头数量
         mlp_ratio=4.0,       # MLP 隐藏层比例
         dropout=0.1          # Dropout 概率
-    ).cuda()
-    x = torch.randn(128, 3, 32, 32).cuda()
+    )
+    x = paddle.randn([128, 3, 32, 32])
     y = model(x)
-    print(f"Total GPU Memory Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+    print(f"Model output shape: {y.shape}")

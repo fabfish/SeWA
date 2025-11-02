@@ -1,9 +1,8 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import paddle
+import paddle.nn as nn
+import paddle.optimizer as optim
 import os
 import argparse
-import torch
 import random
 import numpy as np
 import matplotlib.pyplot as plt
@@ -18,52 +17,50 @@ class IterCount:
     iter = 0
 
 # 训练函数
-def train_step(device, epoch, model, train_loader, optimizer, criterion, iter_n, start_save, save_interval, log_path, logger, logits):
+def train_step(epoch, model, train_loader, optimizer, criterion, iter_n, start_save, save_interval, log_path, logger, logits):
     model.train()
     train_loss = 0
     correct = 0
     total = 0
 
     for batch_idx, (inputs, targets) in enumerate(train_loader):
-        inputs, targets = inputs.to(device), targets.to(device)
-
-        optimizer.zero_grad()
         outputs = model(inputs)
         loss = criterion(outputs, targets)
+        
         loss.backward()
         optimizer.step()
+        optimizer.clear_grad()
 
         iter_n.iter += 1
-        logits.append(model.mask_logit.detach().cpu().numpy())
-        # logger.info(model.mask_logit.detach().cpu().numpy())
+        logits.append(model.mask_logit.numpy())
+        # logger.info(model.mask_logit.numpy())
         # logger.info(batch_idx)
 
         train_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += targets.size(0)
-        correct += predicted.eq(targets).sum().item()
+        predicted = paddle.argmax(outputs, axis=1)
+        total += targets.shape[0]
+        correct += (predicted == targets).astype('float32').sum().item()
 
         if (batch_idx+1) % 20 == 0:
             # logger.info(f"Epoch {epoch} [{batch_idx}/{len(train_loader)}] Loss: {train_loss/(batch_idx+1):.3f}, Acc: {100.*correct/total:.2f}%")
             return logits
 
 # 测试函数
-def test(device, model, loader, criterion, name='Test', logger=None):
+def test(model, loader, criterion, name='Test', logger=None):
     model.eval()
     test_loss = 0
     correct = 0
     total = 0
 
-    with torch.no_grad():
+    with paddle.no_grad():
         for batch_idx, (inputs, targets) in enumerate(loader):
-            inputs, targets = inputs.to(device), targets.to(device)
             outputs = model.get_action(inputs)
             loss = criterion(outputs, targets)
 
             test_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
+            predicted = paddle.argmax(outputs, axis=1)
+            total += targets.shape[0]
+            correct += (predicted == targets).astype('float32').sum().item()
 
     # logger.info(f"{name} Loss: {test_loss/len(loader):.3f}, Acc: {100.*correct/total:.2f}%")
     return 100.*correct/total
@@ -91,32 +88,31 @@ def main():
 
     args = parser.parse_args()
 
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
+    # 设置随机种子
     random.seed(args.seed + 10)
     np.random.seed(args.seed + 20)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    paddle.seed(args.seed)
+    
+    # 设置设备
+    paddle.set_device('gpu' if paddle.is_compiled_with_cuda() else 'cpu')
 
     log_path = f'./log/Average/{args.name}-{args.data_name}-{args.load_start_iter}-{args.k}'
     Path(os.path.join(log_path, 'checkpoint')).mkdir(exist_ok=True, parents=True)
     logger = get_logger('logger', os.path.join(log_path, 'logger.txt'))
 
-
     model_list = []
     step = 1
     # Same with pretrained models
     model = VisionTransformer(img_size=32, patch_size=4, in_channels=3, num_classes=100, embed_dim=256,      
-        depth=8, num_heads=4, mlp_ratio=4.0, dropout=0.1).to(device)
+        depth=8, num_heads=4, mlp_ratio=4.0, dropout=0.1)
     for iter_n in range(args.load_start_iter, args.load_start_iter+args.KK, step):
-        m_path = f'{args.model_path}/checkpoint/iter_{iter_n}.pt'
-        model_list.append(torch.load(m_path))
+        m_path = f'{args.model_path}/checkpoint/iter_{iter_n}.pdparams'
+        model_list.append(paddle.load(m_path))
 
-    ada_model = MergeNet(model, model_list, temperature=args.t, k=args.k).to(device)
+    ada_model = MergeNet(model, model_list, temperature=args.t, k=args.k)
     criterion = nn.CrossEntropyLoss()
-    ada_optimizer = optim.Adam(ada_model.collect_trainable_params(), lr=args.lr)
-    scheduler = optim.lr_scheduler.StepLR(ada_optimizer, step_size=30, gamma=0.1)
+    ada_optimizer = optim.Adam(learning_rate=args.lr, parameters=ada_model.collect_trainable_params())
+    scheduler = optim.lr.StepDecay(learning_rate=args.lr, step_size=30, gamma=0.1)
     train_loader, test_loader = get_data_loader(args.bs, root_path='./data')
     
     iter_n = IterCount
@@ -127,15 +123,15 @@ def main():
     best_test_acc = 0
 
     ada_model.get_model(logger)
-    train_acc.append(test(device, ada_model, train_loader, criterion, name='Train', logger=logger))
-    val_acc.append(test(device, ada_model, test_loader, criterion, name='Test', logger=logger))
+    train_acc.append(test(ada_model, train_loader, criterion, name='Train', logger=logger))
+    val_acc.append(test(ada_model, test_loader, criterion, name='Test', logger=logger))
     
     for epoch in range(args.epoch):
-        logits = train_step(device, epoch, ada_model, train_loader, ada_optimizer, criterion, iter_n, None, None, log_path, logger, logits)
+        logits = train_step(epoch, ada_model, train_loader, ada_optimizer, criterion, iter_n, None, None, log_path, logger, logits)
         ada_model.get_model(logger)
-        train_acc.append(test(device, ada_model, train_loader, criterion, name='Train', logger=logger))
-        val_acc.append(test(device, ada_model, test_loader, criterion, name='Test', logger=logger))
-        # logger.info(ada_model.mask_logit.detach().cpu().numpy())
+        train_acc.append(test(ada_model, train_loader, criterion, name='Train', logger=logger))
+        val_acc.append(test(ada_model, test_loader, criterion, name='Test', logger=logger))
+        # logger.info(ada_model.mask_logit.numpy())
         if best_train_acc < train_acc[-1]:
             best_train_acc = train_acc[-1]
         if best_test_acc < val_acc[-1]:

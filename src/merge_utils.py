@@ -1,8 +1,7 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
 import copy
-import torch
 
 
 def load_and_average_models(model, model_list, steps, last_model=None, add_decay=True):
@@ -18,14 +17,14 @@ def load_and_average_models(model, model_list, steps, last_model=None, add_decay
         if average_params is None:
             # 初始化平均参数
             average_params = {
-                key: torch.zeros_like(value, dtype=torch.float32)
-                for key, value in model_params.items() if value.is_floating_point()
+                key: paddle.zeros_like(value, dtype='float32')
+                for key, value in model_params.items() if paddle.is_floating_point(value)
             }
 
         # 累加参数
         for key in model_params:
             if key in average_params:
-                average_params[key] += model_params[key].float()
+                average_params[key] += model_params[key].astype('float32')
 
         last_model_params = model_params
         count += 1
@@ -49,18 +48,12 @@ def load_and_average_models(model, model_list, steps, last_model=None, add_decay
     if add_decay:
         decay = 0.9
         for name, param in last_model_params.items():
-            if name in last_model_params and param.dtype.is_floating_point:
-                average_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+            if name in last_model_params and paddle.is_floating_point(param):
+                average_params[name] = average_params[name] * decay + param * (1 - decay)
             else:
-                average_params[name] = param.clone().detach()
-    
-    # for name, param in average_params.items():
-    #     if name in last_model_params and param.dtype.is_floating_point:
-    #         last_model_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
-    #     else:
-    #         last_model_params[name] = param.clone().detach()
+                average_params[name] = param.clone()
 
-    target.load_state_dict(average_params)
+    target.set_state_dict(average_params)
     return target
 
 def set_attr(obj, names, val):
@@ -100,19 +93,19 @@ class TaskVector():
             self.vector = vector
         else:
             # assert pretrained_checkpoint is not None
-            with torch.no_grad():
+            with paddle.no_grad():
                 # print('TaskVector:' + pretrained_checkpoint)
-                model.load_state_dict(pretrained_checkpoint)
+                model.set_state_dict(pretrained_checkpoint)
                 # pretrained_state_dict = model.state_dict()
                 self.vector = {}
                 for key, value in model.named_parameters():
-                    # if value.dtype in [torch.int64, torch.uint8]:
+                    # if value.dtype in [paddle.int64, paddle.uint8]:
                     #     continue
                     self.vector[key] = value
     
     def __add__(self, other):
         """Add two task vectors together."""
-        with torch.no_grad():
+        with paddle.no_grad():
             new_vector = {}
             for key in self.vector:
                 if key not in other.vector:
@@ -128,14 +121,14 @@ class TaskVector():
 
     def __neg__(self):
         """Negate a task vector."""
-        with torch.no_grad():
+        with paddle.no_grad():
             new_vector = {}
             for key in self.vector:
                 new_vector[key] = - self.vector[key]
         return TaskVector(vector=new_vector)
 
     def weightmerging(self, taskvectors, coefficients):
-        with torch.no_grad():
+        with paddle.no_grad():
             new_vector = {}
             for key in taskvectors[0].vector:
                 new_vector[key] = sum(coefficients[k] * taskvectors[k][key] for k in range(len(taskvectors)))
@@ -143,8 +136,8 @@ class TaskVector():
 
     def apply_to(self, pretrained_checkpoint, scaling_coef=1.0):
         """Apply a task vector to a pretrained model."""
-        with torch.no_grad():
-            pretrained_model = torch.load(pretrained_checkpoint)
+        with paddle.no_grad():
+            pretrained_model = paddle.load(pretrained_checkpoint)
             new_state_dict = {}
             pretrained_state_dict = pretrained_model.state_dict()
             for key in pretrained_state_dict:
@@ -152,10 +145,10 @@ class TaskVector():
                     print(f'Warning: key {key} is present in the pretrained state dict but not in the task vector')
                     continue
                 new_state_dict[key] = pretrained_state_dict[key] + scaling_coef * self.vector[key]
-        pretrained_model.load_state_dict(new_state_dict, strict=False)
+        pretrained_model.set_state_dict(new_state_dict, use_structured_name=False)
         return pretrained_model
 
-class MergeNet(nn.Module):
+class MergeNet(nn.Layer):
     def __init__(self, model=None, model_list=None, temperature=1.0, k=10):
         super(MergeNet, self).__init__()
 
@@ -163,7 +156,7 @@ class MergeNet(nn.Module):
         self.model_list = model_list
         self.infer_model = copy.deepcopy(model).eval()
         for p in self.infer_model.parameters():
-            p.requires_grad = False
+            p.stop_gradient = True
         self.n = len(model_list)
         self.temperature = temperature
         self.k = k
@@ -180,10 +173,11 @@ class MergeNet(nn.Module):
                 non_params[k] = v
         self.non_params = non_params
 
-        self.mask_logit = nn.Parameter(torch.zeros(self.n), requires_grad=True)
-        # random_idx = torch.randperm(self.n)[:int(k / 2)]
+        self.mask_logit = self.create_parameter(shape=[self.n], default_initializer=nn.initializer.Constant(0.0))
+        # random_idx = paddle.randperm(self.n)[:int(k / 2)]
         step = int(self.n / self.k)
-        self.mask_logit.data[::step] = 0.001
+        self.mask_logit.set_value(paddle.zeros([self.n]))
+        self.mask_logit[::step] = 0.001
 
         paramslist = []
         shape_list = []
@@ -191,9 +185,9 @@ class MergeNet(nn.Module):
         for k, v in task_vectors[0].vector.items():
             shape_list.append(v.shape)
             itx.append(itx[-1] + v.flatten().shape[0])
-        paramslist += [[v.detach().requires_grad_().flatten() for _, v in tv.vector.items()]  for i, tv in enumerate(task_vectors)] # task vectors
+        paramslist += [[v.detach().flatten() for _, v in tv.vector.items()] for i, tv in enumerate(task_vectors)] # task vectors
         self.paramslist = paramslist
-        self.params_tensor = torch.stack([torch.cat(p) for p in self.paramslist]).cuda()
+        self.params_tensor = paddle.stack([paddle.concat(p) for p in self.paramslist])
         self.shape_list = shape_list
         self.itx = itx
 
