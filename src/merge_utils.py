@@ -195,27 +195,27 @@ class MergeNet(nn.Layer):
         return [self.mask_logit]
     
     def gumbel_softmax(self, temperature=1.0, eps=1e-9):
-        u = torch.rand_like(self.mask_logit)
-        gumbel = -torch.log(-torch.log(u + eps) + eps)
+        u = paddle.rand_like(self.mask_logit)
+        gumbel = -paddle.log(-paddle.log(u + eps) + eps)
         y = self.mask_logit + gumbel
         y = F.sigmoid(y / temperature)
 
-        y_hard = torch.zeros_like(y)
+        y_hard = paddle.zeros_like(y)
         y_hard[y > 0.5] = 1.0
 
         return (y_hard - y).detach() + y
 
     def project_logit(self):
-        with torch.no_grad():
-            k_th_lagest = torch.topk(self.mask_logit, self.k)[0][-1]
-            self.mask_logit.data[self.mask_logit < k_th_lagest] = -1e9
+        with paddle.no_grad():
+            k_th_lagest = paddle.topk(self.mask_logit, self.k)[0][-1]
+            self.mask_logit.set_value(self.mask_logit * (self.mask_logit >= k_th_lagest) - 1e9 * (self.mask_logit < k_th_lagest))
 
     def compute_mask(self, eval=False):
         if not eval:
             mask = self.gumbel_softmax(self.temperature)
         else:
-            topk_values, topk_indices = torch.topk(self.mask_logit, self.k)
-            mask = torch.zeros_like(self.mask_logit)
+            topk_values, topk_indices = paddle.topk(self.mask_logit, self.k)
+            mask = paddle.zeros_like(self.mask_logit)
             mask[topk_indices] = 1
         return mask
 
@@ -223,11 +223,11 @@ class MergeNet(nn.Layer):
         mask = self.compute_mask(eval=eval)
         # params = tuple(sum(tuple(pi * lambdasi for pi, lambdasi in zip(p, mask))) / self.k for j, p in enumerate(zip(*self.paramslist)))
         # params = tuple(p.cuda() for p in params)
-        params = torch.sum(mask.unsqueeze(-1) * self.params_tensor, dim=0) / self.k
+        params = paddle.sum(mask.unsqueeze(-1) * self.params_tensor, axis=0) / self.k
         recover = []
         for i, sp in enumerate(self.shape_list):
             recover.append(params[self.itx[i]: self.itx[i+1]].reshape(sp))
-        params = tuple(p.cuda() for p in recover)
+        params = tuple(p for p in recover)
         
         self.model = load_weights(self.model, self.names, params)
         self.model.to(device=x.device)
