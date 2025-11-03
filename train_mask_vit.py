@@ -85,6 +85,7 @@ def main():
     parser.add_argument("--epoch", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--lr_decay", action='store_true')
+    parser.add_argument("--data_root", type=str, default="./data", help="CIFAR数据所在目录，包含cifar-100-python.tar.gz")
 
     args = parser.parse_args()
 
@@ -113,7 +114,7 @@ def main():
     criterion = nn.CrossEntropyLoss()
     ada_optimizer = optim.Adam(learning_rate=args.lr, parameters=ada_model.collect_trainable_params())
     scheduler = optim.lr.StepDecay(learning_rate=args.lr, step_size=30, gamma=0.1)
-    train_loader, test_loader = get_data_loader(args.bs, root_path='./data')
+    train_loader, test_loader = get_data_loader(args.bs, root_path=args.data_root)
     
     iter_n = IterCount
     train_acc = []

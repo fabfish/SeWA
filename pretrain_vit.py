@@ -85,6 +85,7 @@ def main():
     parser.add_argument("--epoch", type=int, default=200)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--lr_decay", action='store_true')
+    parser.add_argument("--data_root", type=str, default="./data", help="CIFAR数据所在目录，包含cifar-100-python.tar.gz")
 
     args = parser.parse_args()
 
@@ -94,7 +95,7 @@ def main():
     paddle.seed(args.seed)
 
     # 数据加载
-    train_loader, test_loader = get_data_loader(args.bs, root_path='./data')
+    train_loader, test_loader = get_data_loader(args.bs, root_path=args.data_root)
 
     # 设置设备
     paddle.set_device('gpu' if paddle.is_compiled_with_cuda() else 'cpu')
